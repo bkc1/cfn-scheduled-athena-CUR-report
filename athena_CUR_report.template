@@ -1,0 +1,163 @@
+AWSTemplateFormatVersion: 2010-09-09
+Parameters:
+  Database:
+    Type: String
+    Description: Athena Database name
+  Table:
+    Type: String
+    Description: Athena Table name
+  Bucket:
+    Type: String
+    Description: S3 output location, i.e s3://my_bucket
+
+Resources:
+  CURRefreshLambdaExecutor:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: CURRefreshLambdaExecutor
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 'arn:aws:logs:*:*:*'
+              - Effect: Allow
+                Action:
+                  - 's3:*'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'athena:*'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'glue:*'
+                Resource: '*'
+  CURRefresh:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: 'Athena_CUR_Refresh'
+      Environment:
+        Variables:
+          bucket:
+            Ref: Bucket
+          database:
+            Ref: Database
+          table:
+            Ref: Table
+      Code:
+        ZipFile: |
+          import time
+          import boto3
+          import os
+
+          # athena constant
+          DATABASE = os.environ['database']
+          TABLE = os.environ['table']
+
+          # S3 constant
+          S3_OUTPUT = os.environ['bucket']
+
+          # number of retries
+          RETRY_COUNT = 10
+
+          def lambda_handler(event, context):
+
+            query = F"""SELECT product_product_name AS Product_name,
+            line_item_usage_type AS Usage_type,
+            product_region AS Region,
+            line_item_resource_id AS Resource_ID,
+            sum(line_item_unblended_cost) AS Cost
+            FROM {TABLE}
+            WHERE line_item_line_item_description LIKE '%data transfer%'
+            GROUP BY product_product_name, line_item_usage_type, product_region, line_item_resource_id
+            ORDER BY  sum(line_item_unblended_cost)
+            DESC limit 200;"""
+
+            # athena client
+            client = boto3.client('athena')
+
+            # Execution
+            response = client.start_query_execution(
+                QueryString=query,
+                QueryExecutionContext={
+                    'Database': DATABASE
+                },
+                ResultConfiguration={
+                    'OutputLocation': S3_OUTPUT,
+                }
+            )
+
+            # get query execution id
+            query_execution_id = response['QueryExecutionId']
+            print(query_execution_id)
+
+            # get execution status
+            for i in range(1, 1 + RETRY_COUNT):
+
+                # get query execution
+                query_status = client.get_query_execution(QueryExecutionId=query_execution_id)
+                query_execution_status = query_status['QueryExecution']['Status']['State']
+
+                if query_execution_status == 'SUCCEEDED':
+                    print("STATUS:" + query_execution_status)
+                    break
+
+                if query_execution_status == 'FAILED':
+                    raise Exception("STATUS:" + query_execution_status)
+
+                else:
+                    print("STATUS:" + query_execution_status)
+                    time.sleep(i)
+            else:
+                client.stop_query_execution(QueryExecutionId=query_execution_id)
+                raise Exception('TIME OVER')
+
+            # get query results
+            result = client.get_query_results(QueryExecutionId=query_execution_id)
+            print(result)
+      Handler: 'index.lambda_handler'
+      Timeout: 30
+      Runtime: python3.7
+      ReservedConcurrentExecutions: 1
+      Role: !GetAtt CURRefreshLambdaExecutor.Arn
+
+  ScheduledRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: 'CUR_hourly_refresh'
+      ScheduleExpression: "rate(1 hour)"
+      State: "ENABLED"
+      Targets:
+        -
+          Arn:
+            Fn::GetAtt:
+              - "CURRefresh"
+              - "Arn"
+          Id: "TargetFunctionV1"
+
+  PermissionForEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName:
+        Ref: "CURRefresh"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn:
+        Fn::GetAtt:
+          - "ScheduledRule"
+          - "Arn"
